@@ -65,41 +65,110 @@ def is_target_market(m):
 
 @st.cache_data(ttl=8, show_spinner=False)
 def discover_market():
-    candidates = []
-    # Gamma event results often contain the market objects directly.
-    for endpoint, params in [
-        (f"{GAMMA}/events", {"active": "true", "closed": "false", "limit": 100}),
-        (f"{GAMMA}/markets", {"active": "true", "closed": "false", "limit": 200}),
-    ]:
+    """
+    Find the currently running BTC 5-minute event using Polymarket's recurring
+    series slug. Gamma events contain event-level start/end times and nested
+    market token IDs, so preserve both levels when building the market record.
+    """
+    now = datetime.now(timezone.utc)
+    events = []
+
+    # The 5-minute series has a known slug; searching generic active markets
+    # misses it and event titles do not always contain "5 minute".
+    requests_to_try = [
+        (f"{GAMMA}/events", {
+            "series_slug": "btc-up-or-down-5m",
+            "closed": "false",
+            "limit": 500,
+            "order": "endDate",
+            "ascending": "true",
+        }),
+        (f"{GAMMA}/events", {
+            "active": "true",
+            "closed": "false",
+            "limit": 500,
+            "order": "endDate",
+            "ascending": "true",
+        }),
+    ]
+
+    for endpoint, params in requests_to_try:
         try:
             data = get_json(endpoint, params)
             if isinstance(data, dict):
-                data = data.get("events", data.get("markets", []))
-            for item in data or []:
-                if isinstance(item, dict) and isinstance(item.get("markets"), list):
-                    candidates.extend(item["markets"])
-                elif isinstance(item, dict):
-                    candidates.append(item)
+                data = data.get("events", [])
+            if isinstance(data, list):
+                events.extend(x for x in data if isinstance(x, dict))
+            # If the targeted series returned events, don't dilute it with
+            # broad search results.
+            if events and params.get("series_slug"):
+                break
         except Exception:
             continue
-    # Deduplicate by market id/slug.
-    unique = {}
-    for m in candidates:
-        unique[str(m.get("id") or m.get("slug") or id(m))] = m
-    matches = [m for m in unique.values() if is_target_market(m)]
-    if not matches:
-        return None, "Couldn't confidently identify an active BTC 5-minute Up/Down market. Check that Polymarket currently lists one, then refresh."
-    now = datetime.now(timezone.utc)
-    def end_sort(m):
-        raw = m.get("endDate") or m.get("end_date_iso") or ""
+
+    def parse_dt(value):
+        if not value:
+            return None
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except Exception:
-            return now
-    future = [m for m in matches if end_sort(m) >= now]
-    pool = future or matches
-    pool.sort(key=end_sort)
-    return pool[0], None
+            return None
+
+    # Keep only events that are in their actual 5-minute trading window.
+    active_candidates = []
+    seen = set()
+    for event in events:
+        slug = str(event.get("slug") or "")
+        text_blob = " ".join(str(event.get(k, "")) for k in ["slug", "title", "question", "description"]).lower()
+        # Canonical event slug pattern: btc-updown-5m-<window-start-epoch>.
+        slug_match = re.fullmatch(r"btc-updown-5m-\d+", slug)
+        if not slug_match:
+            continue
+        if event.get("closed") is True or event.get("active") is False:
+            continue
+
+        start_dt = parse_dt(event.get("eventStartTime") or event.get("startDate") or event.get("start_date"))
+        end_dt = parse_dt(event.get("endDate") or event.get("end_date_iso"))
+        if start_dt is None:
+            try:
+                start_epoch = int(slug.rsplit("-", 1)[1])
+                start_dt = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+            except Exception:
+                continue
+        if end_dt is None:
+            end_dt = start_dt.replace() + __import__("datetime").timedelta(minutes=5)
+
+        # The live market is the one whose start <= now < end.
+        if not (start_dt <= now < end_dt):
+            continue
+        for m in event.get("markets", []) or []:
+            if not isinstance(m, dict):
+                continue
+            # Event fields are needed for the question, slug, and timing.
+            merged = {**event, **m}
+            merged["event_slug"] = slug
+            merged["event_start_time"] = start_dt.isoformat()
+            merged["endDate"] = end_dt.isoformat()
+            key = str(merged.get("id") or merged.get("conditionId") or slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            active_candidates.append(merged)
+
+    if not active_candidates:
+        return None, (
+            "Couldn't find the currently running BTC 5-minute market. "
+            "Polymarket's event listing may have changed or the API may be temporarily unavailable. "
+            "The app will not guess a market."
+        )
+
+    # The recurring event should contain one market; if there are several,
+    # select the first with a valid UP/DOWN token mapping.
+    for m in active_candidates:
+        if "UP" in token_map(m) and "DOWN" in token_map(m):
+            return m, None
+
+    return active_candidates[0], None
 
 def token_map(m):
     outcomes = parse_json_field(m.get("outcomes"))
@@ -232,8 +301,9 @@ c4.metric("Time remaining", f"{seconds_left//60}:{seconds_left%60:02d}" if secon
 
 st.subheader("Current market")
 st.write(f"**{market.get('question') or market.get('title') or market.get('slug')}**")
-if market.get("slug"):
-    st.markdown(f"[Open this market on Polymarket](https://polymarket.com/event/{market.get('slug')})")
+event_slug = market.get("event_slug") or market.get("slug")
+if event_slug:
+    st.markdown(f"[Open this market on Polymarket](https://polymarket.com/event/{event_slug})")
 st.caption("Important: BTC/USDT from Binance is a comparison feed, not necessarily the official resolution oracle. Read the market's rules before acting.")
 
 st.subheader("Signal monitor")
@@ -327,3 +397,4 @@ with st.expander("Set up alerts"):
     st.write("For dependable 24/7 monitoring even when nobody has the dashboard open, a separate always-on worker is still needed. This Streamlit version collects snapshots while the app is running and being visited.")
 with st.expander("How to read the order book"):
     st.write("Best bid = highest price a buyer is currently offering. Best ask = lowest price a seller is currently asking. The difference is the spread. Large size at the best quote can disappear quickly; snapshots do not guarantee you could fill there.")
+
