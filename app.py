@@ -8,8 +8,9 @@ from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="BTC Signal Lab", page_icon="₿", layout="centered")
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+# Binance's public market-data-only host can work when the main API host is blocked.
+BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
+TICKER_URL = "https://data-api.binance.vision/api/v3/ticker/price"
 
 st.markdown("""
 <style>
@@ -150,7 +151,15 @@ try:
             "That conversion does not make the numbers calibrated probabilities. The next build "
             "should use historical candles, time-ordered out-of-sample testing, and calibration."
         )
+except requests.HTTPError as exc:
+    status = exc.response.status_code if exc.response is not None else "unknown"
+    st.error("Could not load BTC market data right now.")
+    st.write(
+        "The data provider rejected the request. This updated version uses Binance's "
+        "public market-data-only endpoint. If it still fails, wait briefly and check the app logs."
+    )
+    st.caption(f"HTTP status: {status}")
 except Exception as exc:
     st.error("Could not load BTC market data right now.")
-    st.write("Wait a little and refresh the page. If this keeps happening, the public data endpoint may be rate-limited or unavailable.")
+    st.write("Wait a little and refresh the page. The public data endpoint may be rate-limited or temporarily unavailable.")
     st.caption(f"Technical detail: {type(exc).__name__}")
